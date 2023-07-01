@@ -31,7 +31,7 @@ var unsupportedTerraformBlocks = []string{
 	"aws_lb_listener_rule",                   // This resource does not support tags, although docs state otherwise.
 	"aws_cloudwatch_log_destination",         // This resource does not support tags, although docs state otherwise.
 	"google_monitoring_notification_channel", //This resource uses labels for other purposes.
-	"aws_secretsmanager_secret_rotation",         // This resource does not support tags, although tfschema states otherwise.
+	"aws_secretsmanager_secret_rotation",     // This resource does not support tags, although tfschema states otherwise.
 }
 
 var taggableResourcesLock sync.RWMutex
@@ -179,7 +179,7 @@ func (p *TerraformParser) ParseFile(filePath string) ([]structure.IBlock, error)
 	return parsedBlocks, nil
 }
 
-func (p *TerraformParser) WriteFile(readFilePath string, blocks []structure.IBlock, writeFilePath string) error {
+func (p *TerraformParser) WriteFile(readFilePath string, blocks []structure.IBlock, writeFilePath string, addToggle bool) error {
 	// #nosec G304
 	// read file bytes
 	src, err := os.ReadFile(readFilePath)
@@ -205,7 +205,7 @@ func (p *TerraformParser) WriteFile(readFilePath string, blocks []structure.IBlo
 			if parsedBlock.IsBlockTaggable() {
 				parsedBlockLabels := parsedBlock.(*TerraformBlock).HclSyntaxBlock.Labels
 				if reflect.DeepEqual(parsedBlockLabels, rawBlockLabels) {
-					p.modifyBlockTags(rawBlock, parsedBlock)
+					p.modifyBlockTags(rawBlock, parsedBlock, addToggle)
 				}
 			}
 		}
@@ -260,13 +260,35 @@ func (p *TerraformParser) WriteFile(readFilePath string, blocks []structure.IBlo
 	return nil
 }
 
-func (p *TerraformParser) modifyBlockTags(rawBlock *hclwrite.Block, parsedBlock structure.IBlock) {
+func (p *TerraformParser) modifyBlockTags(rawBlock *hclwrite.Block, parsedBlock structure.IBlock, addToggle bool) {
 	mergedTags := parsedBlock.MergeTags()
 	tagsAttributeName := parsedBlock.(*TerraformBlock).TagsAttributeName
 	tagsAttribute := rawBlock.Body().GetAttribute(tagsAttributeName)
+	src := []byte(" var.turn_off_yor_tags ? {} : ")
+
 	if tagsAttribute == nil {
 		mergedTagsTokens := buildTagsTokens(mergedTags)
 		if mergedTagsTokens != nil {
+			if addToggle {
+				expRaw, _ := hclsyntax.LexExpression(src, "", hcl.InitialPos)
+				var exp hclwrite.Tokens
+				for _, v := range expRaw {
+					transV := hclwrite.Token{
+						Type:  v.Type,
+						Bytes: v.Bytes,
+					}
+					exp = append(exp, &transV)
+				}
+				mergedTagsTokens = InsertTokens(exp, mergedTagsTokens)
+				mergedTagsTokens = InsertToken(mergedTagsTokens, 0, &hclwrite.Token{
+					Type:  hclsyntax.TokenOParen,
+					Bytes: []byte("("),
+				})
+				mergedTagsTokens = InsertToken(mergedTagsTokens, len(mergedTagsTokens), &hclwrite.Token{
+					Type:  hclsyntax.TokenCParen,
+					Bytes: []byte(")"),
+				})
+			}
 			rawBlock.Body().SetAttributeRaw(tagsAttributeName, mergedTagsTokens)
 		}
 	} else {
@@ -336,7 +358,33 @@ func (p *TerraformParser) modifyBlockTags(rawBlock *hclwrite.Block, parsedBlock 
 				// => we should replace it!
 				rawTagsTokens = newTagsTokens
 			} else {
+				originalRawTagsTokens := rawTagsTokens
 				rawTagsTokens = InsertTokens(rawTagsTokens, newTagsTokens[2:len(newTagsTokens)-2])
+				if addToggle {
+					expRaw, _ := hclsyntax.LexExpression([]byte(" var.turn_off_yor_tags ?"), "", hcl.InitialPos)
+					var exp hclwrite.Tokens
+					for _, v := range expRaw {
+						transV := hclwrite.Token{
+							Type:  v.Type,
+							Bytes: v.Bytes,
+						}
+						exp = append(exp, &transV)
+					}
+
+					originalRawTagsTokens = InsertToken(originalRawTagsTokens, len(originalRawTagsTokens), &hclwrite.Token{
+						Type:  hclsyntax.TokenColon,
+						Bytes: []byte(":"),
+					})
+					rawTagsTokens = InsertTokens(InsertTokens(exp, originalRawTagsTokens), rawTagsTokens)
+					rawTagsTokens = InsertToken(rawTagsTokens, 0, &hclwrite.Token{
+						Type:  hclsyntax.TokenOParen,
+						Bytes: []byte("("),
+					})
+					rawTagsTokens = InsertToken(rawTagsTokens, len(rawTagsTokens), &hclwrite.Token{
+						Type:  hclsyntax.TokenCParen,
+						Bytes: []byte(")"),
+					})
+				}
 			}
 			rawBlock.Body().SetAttributeRaw(tagsAttributeName, rawTagsTokens)
 			return
@@ -345,6 +393,18 @@ func (p *TerraformParser) modifyBlockTags(rawBlock *hclwrite.Block, parsedBlock 
 		// These lines execute if there is either a `merge` operator at the start of the tags,
 		// or if it is rendered via a variable / local.
 		newTagsTokens := buildTagsTokens(newTags)
+		if addToggle {
+			expRaw, _ := hclsyntax.LexExpression(src, "", hcl.InitialPos)
+			var exp hclwrite.Tokens
+			for _, v := range expRaw {
+				transV := hclwrite.Token{
+					Type:  v.Type,
+					Bytes: v.Bytes,
+				}
+				exp = append(exp, &transV)
+			}
+			newTagsTokens = InsertTokens(exp, newTagsTokens)
+		}
 		if !isMergeOpExists && newTagsTokens != nil {
 			// Insert the merge token, opening and closing parenthesis tokens
 			rawTagsTokens = InsertToken(rawTagsTokens, 0, &hclwrite.Token{
@@ -372,6 +432,16 @@ func (p *TerraformParser) modifyBlockTags(rawBlock *hclwrite.Block, parsedBlock 
 
 			for _, tagToken := range newTagsTokens {
 				rawTagsTokens = InsertToken(rawTagsTokens, len(rawTagsTokens)-1, tagToken)
+			}
+			if addToggle {
+				rawTagsTokens = InsertToken(rawTagsTokens, 0, &hclwrite.Token{
+					Type:  hclsyntax.TokenOParen,
+					Bytes: []byte("("),
+				})
+				rawTagsTokens = InsertToken(rawTagsTokens, len(rawTagsTokens), &hclwrite.Token{
+					Type:  hclsyntax.TokenCParen,
+					Bytes: []byte(")"),
+				})
 			}
 		}
 		// Set the body's tags to the new built tokens
@@ -542,7 +612,7 @@ func ExtractSubdirFromRemoteModuleSrc(raw string) string {
 	// we must remove before we start processing source string. We are using
 	// the fact that such double slashes always have : on the left.
 	parts := strings.Split(raw, "://")
-	parts = strings.Split(parts[len(parts) - 1], "//")
+	parts = strings.Split(parts[len(parts)-1], "//")
 
 	if len(parts) == 1 {
 		return ""
